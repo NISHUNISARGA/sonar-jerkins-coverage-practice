@@ -1,0 +1,166 @@
+# opus-documentprintdata-service
+
+GI (General Insurance) Motor document/report data assembly service: builds the XML data payload for ~45 distinct Motor insurance document/report types (certificates, cover notes, endorsements, tax invoices, debit notes, policy schedules, group tax invoices, etc.) from MongoDB and several upstream OPUS core services. Status: active development (current branch `r1/wave1/feature/OPUSM-50158-api-fixes` off `retrofit-develop-R1`). Owning team: not declared for application code in this repo — `.github/CODEOWNERS` only assigns `.github/workflows/` to `@OPUSCCC/cloud_engineers_devops`. Contact: N/A — no contact details committed to the repo.
+
+## Overview
+
+This service (Maven artifact `gi-documentprintdata`, CI/Sonar identifier `opus-gi-documentprintdata-service`, Spring application name `Documentprintdata`) exposes a single generic endpoint that, given a `reportName` value, selects one of ~45 hard-coded branches, gathers the relevant data (mostly via direct MongoDB aggregation queries, plus calls to several external OPUS REST APIs), and returns the result as an XML string embedded in a JSON envelope. It is a read-side reporting/document-data layer for Malaysian motor insurance policy administration (contract, risk, cover, agent, and branch data) — no business documents, contracts, or policies are created or mutated here. The caller is presumed to be an upstream OPUS report/print orchestration component that then renders the XML into a printable document, though the actual caller is not identifiable from this repository. A key constraint is that the entire API surface is driven by a single large `switch` on report-name string literals in one controller method, tightly coupling routing to legacy OPUS report identifiers.
+
+## Tech Stack
+
+| Component | Details |
+|---|---|
+| Language/Runtime | Java 17 |
+| Framework | Spring Boot 3.5.14 (Spring MVC **and** Spring WebFlux both on the classpath; Spring Security 6.5.9; springdoc-openapi 2.8.15 for Swagger UI) |
+| Database | MongoDB (Spring Data MongoDB; access almost entirely via raw `MongoTemplate` + hand-built aggregation `Document` pipelines, not `MongoRepository` interfaces) |
+| Messaging | N/A — no message broker / queue dependency found in `pom.xml` or source |
+| Build tool | Maven, via the committed wrapper (`mvnw` / `mvnw.cmd`, wrapper pinned to Maven 3.9.11) |
+
+## Architecture
+
+```
+com.agcs.fo.opus.motor
+├── OpusMotorGatewayApplication.java   – Spring Boot entry point
+├── client/            – RestTemplate/WebClient clients to external OPUS core REST APIs
+│                         (policy, customer, and "utils" engines)
+├── config/            – SecurityConfig, OpenApiConfig, RestTemplateConfig (custom TLS
+│                         truststore + HTTP timeouts), JacksonConfig, ReportSettings
+│                         (feature-toggle config properties)
+├── controller/        – REST entrypoints. CommonController is the only implemented
+│                         controller; DocumentController and ExtendedController are
+│                         empty placeholder classes with no endpoints
+├── documentHandler/   – 42 handler classes, one per document/report type; each builds
+│                         a document-specific DTO, mostly by querying MongoDB directly
+│                         via an injected MongoTemplate
+├── documentdto/       – DTOs mapped from Mongo aggregation results (clauses,
+│                         certificates, benefits, vehicles, drivers, etc.)
+├── dto/               – general-purpose DTOs (API envelope, policy/branch/customer
+│                         records, response wrappers)
+├── enums/             – small enum types (e.g. RemarkFilterType)
+├── exception/         – GlobalExceptionHandler (RFC 7807 ProblemDetail) + NoDataFoundException
+├── interceptor/       – CustomRequestFilter / CustomHttpServletRequestWrapper: rewrites
+│                         inbound JSON bodies (e.g. normalizes filterCondition.pBranch
+│                         arrays to comma-separated strings) before controllers see them
+├── payload/           – PayLoadRequest, the single request DTO accepted by CommonController
+├── policyScheduleHandler/ – handlers specific to policy-schedule / master-policy-dumper
+│                              document generation
+├── repository/        – only two @Repository classes (CertificateMultipleRepository,
+│                         GrouptaxinvoiceRepository), both wrapping raw MongoTemplate
+│                         aggregation pipelines; most other Mongo access happens directly
+│                         inside handler/service classes instead of going through a
+│                         repository layer
+├── requestpayload/    – XML/report transaction model classes (Transaction,
+│                         TemplateDetails, ReportTransaction, etc.), serialized to XML
+│                         via Jackson's XmlMapper
+├── util(s)/           – XmlConverter, CommonUtils, DateUtils, CustomDateSerializer, and
+│                         OPUSConstants (a large shared constants class; see Caveats)
+└── service/           – 72 service classes, one per document/report use case,
+                          orchestrating handlers/clients/repositories into the final
+                          Transactions/XML tree returned to the caller
+```
+
+## Data Model / Persistence
+
+- MongoDB is the only persistence store (`spring-boot-starter-data-mongodb`), configured in `src/main/resources/application.properties` / `application-env.properties`.
+- There are no `MongoRepository<T, ID>` interfaces; data access is done through raw `MongoTemplate` and hand-built aggregation `Document` pipelines (see `CertificateMultipleRepository`, `GrouptaxinvoiceRepository`, and most `documentHandler`/`service` classes).
+- Collections referenced by name across the code include `UWGE_RISK_VEH`, `UWGE_RISK`, `UWGE_COVER`, `UWGE_POLICY_CONTRACTS`, `UWGE_POLICY_VERSIONS`, `UWGE_POLICY_BASES`, `UWGE_COVER_CLAUSE_HDR` (and `WIP_`-prefixed working-copy variants), `CMDM_BRANCH`, `CMGE_CODE`, `SAPM_COMPANY`, `DMT_AGENTS`, `DMAG_AGENTS`, `DMAG_GST`, `CPGE_VI_PARTNERS_ALL`, `CPGE_VI_ADDRESS_ALL`, `CMUW_CLAUSE`, `SB_UWGE_POLICY_VERSIONS`, among others.
+- Only read (`find`/`aggregate`) operations were found in the reviewed repository/handler code — no inserts/updates/deletes. This service therefore appears to be a read-only consumer of collections owned by upstream OPUS policy-administration systems, not their owner.
+
+## Security / Access Control
+
+- Spring Security is present but configured permissively: `SessionCreationPolicy.STATELESS`, CSRF disabled for all paths (with an in-code justification comment), and `anyRequest().permitAll()` — **no authentication or authorization is enforced on any business endpoint.**
+- Only `/actuator/**` is restricted: `/actuator/health` and `/actuator/info` are `permitAll`, everything else under `/actuator/**` is `denyAll`.
+- An `InMemoryUserDetailsManager` bean is declared but has no users configured and is not wired into any authentication flow — effectively unused.
+- No JWT, OAuth2, API key, or other bearer-token handling was found anywhere under `src/main/java`.
+- Outbound calls to upstream OPUS services use a custom TLS truststore (`mytruststore.p12`, configured in `RestTemplateConfig`) to trust server certificates, but no client credentials/headers are attached to those outbound calls in the reviewed client classes.
+
+## Data Classification / Compliance
+
+- No explicit data-classification tags, PII markers, or compliance annotations exist in the code.
+- DTOs and Mongo collections carry policyholder/customer personal data (names, addresses, vehicle registration and driver details, GST registration numbers, premium amounts) for Malaysian motor insurance documents — this should be treated as sensitive/PII in practice even though the repository does not label it as such.
+- No MongoDB connection string, credential, or other secret is present anywhere in the tracked source (`application.properties`, `application-env.properties`, or `config/`); the actual database connection is not sourced from this repository, so its credential handling cannot be assessed from the code alone.
+
+## Dependencies
+
+**Upstream (called by this service, base URL configured via `API_BASE-URL`):**
+
+| External API (client class) | Protocol | Purpose |
+|---|---|---|
+| PME API — `get-contract-id`, `get-policy-ref` (`PMEGetContractIdClient`, `PolicyRefClient`) | HTTPS REST/JSON | Contract ID / policy reference lookups |
+| PG_RPGE_UTILS — `comp-brn-number`, `invoice-indicator`, `invoice-print-endt-indicator` (`PgRpgeUtilsClient`, `EinvoiceIndicatorClient`) | HTTPS REST/JSON | Branch/company registration numbers, e-invoice indicators |
+| PG_UWGE_UTILS — `sst-rollout-date` (`SSTRolloutDateClient`) | HTTPS REST/JSON | SST tax rollout date |
+| PG_UTIL_GENERAL — `get-code-desc`, `fn-get-char-value-constants` (`PgUtilGeneralService`, `FnGetCodeDescClient`, `GrouptaxinvoiceConstantsClient`) | HTTPS REST/JSON | Generic code/description and constants lookup |
+| Customer engine — `pgcpgentable`, `pg-cp-gen-table`, `fn-rppm-get-signature`, `fn-prnt-ptv-trans` (`PrntPtvTransClient`) | HTTPS REST/JSON | Customer/address/signature data |
+| e-Invoice QR indicator API (`EinvoiceQrIndicatorClient`) | HTTPS REST/JSON | QR code indicator for e-invoicing |
+| Clause description API (`ClauseDescriptionClient`, `func-getdesc`) | HTTPS REST/JSON (WebClient) | Clause description lookups (the one reactive/non-blocking client in the codebase) |
+| GST rate endpoint (`gst.rate.endpoint`) | HTTPS REST/JSON | Latest GST rate |
+
+All are reached over `RestTemplate` (one client uses `WebClient`) against a configurable `API_BASE-URL` (currently pointing at `dev1-apiservice.opusm.srv.allianz` in the committed properties), secured with a custom TLS truststore.
+
+**Downstream (services that call this one):**
+
+N/A — no caller identity, API gateway/route configuration, or contract definitions for consumers of `/api/opus/GenerateReport` are present in this repository. Based on the endpoint's naming and XML/report-envelope shape it is presumably invoked by an OPUS report-generation/print orchestrator, but this cannot be confirmed from the code alone.
+
+**Shared libraries:** none internal — no custom shared-library dependency (all `com.agcs.*`/`com.fasterxml.*`/`org.springframework.*` dependencies in `pom.xml` are third-party or the project's own artifact).
+
+## Setup & Run
+
+**Prerequisites:** JDK 17; no local Maven install required (wrapper provided); network access to the configured MongoDB Atlas cluster and to the `API_BASE-URL` host; `mytruststore.p12` (already committed under `src/main/resources`).
+
+**Build:**
+```
+./mvnw clean install
+```
+(`mvnw.cmd clean install` on Windows)
+
+**Run locally:**
+```
+./mvnw spring-boot:run
+```
+or run the packaged jar directly:
+```
+java -jar target/gi-documentprintdata-0.0.1-SNAPSHOT.jar
+```
+Active profile is `dev` (`spring.profiles.active=dev`); the app listens on port `8080` under context path `/gi/documentprintdata`.
+
+**Test:**
+```
+./mvnw test
+```
+(JUnit 5 + Mockito). `./mvnw verify` additionally runs the JaCoCo agent/report (`target/site/jacoco/jacoco.xml`), which the CI Sonar step (`.github/workflows/sonar-code-review.yml`) consumes.
+
+## API / Interfaces
+
+- **Swagger/OpenAPI UI:** `/gi/documentprintdata/swagger-ui/index.html` (OpenAPI JSON at `/gi/documentprintdata/v3/api-docs`); `OpenApiConfig` groups paths matching `/api/**` under a "public" group.
+- **Implemented endpoints** (`CommonController`, mounted at `/gi/documentprintdata/api/opus/GenerateReport`):
+    - `GET /getJSON` — returns an (currently always-empty) `ResponseDTO` serialized as XML.
+    - `POST /` — accepts a `PayLoadRequest` (`metadata` + `filterCondition` maps). `filterCondition.reportName` selects one of ~45 branches in a single `switch` statement, each delegating to a dedicated `*Service`, and returns a `SuccessResponse { status, xmlData, timestamp }` wrapping the generated `Transactions` tree serialized to an XML string inside a JSON body.
+- `DocumentController` and `ExtendedController` exist as classes but currently define no endpoints (empty/placeholder).
+
+## Error Handling & Response Contract
+
+- `GlobalExceptionHandler` (`@RestControllerAdvice`) returns an RFC 7807 `ProblemDetail` for `NoDataFoundException` (HTTP 404, `errorCode=NO_DATA`) and for any other unhandled `Exception` (HTTP 500, `errorCode=INTERNAL_ERROR`), each with a `timestamp` property.
+- `NoDataFoundException` is defined but not thrown anywhere in the current codebase — the 404 path in the global handler is effectively dead code today.
+- The main `POST` endpoint does **not** rely on the global handler for its own business errors: an unrecognized `reportName` or a `null` `Transaction` is handled inline and answered with HTTP 200 and `status: "SUCCESS"` plus a default/empty XML payload, rather than an error response. Callers cannot distinguish "no data found" from "unrecognized report type" purely from the HTTP status.
+
+## Observability & Monitoring
+
+- Actuator `health` and `info` endpoints are exposed and permitted (`management.endpoints.web.exposure.include=health,info`); `management.endpoint.loggers.enabled=true` is set, but `loggers` is not in the exposure include list, so it is not reachable over HTTP.
+- No metrics registry (e.g. `micrometer-registry-prometheus`) is on the classpath, so there is no `/actuator/metrics` or Prometheus scrape endpoint beyond Spring Boot's un-exposed defaults.
+- Logging is via SLF4J/Logback (Spring Boot defaults). `application.properties` sets `DEBUG` for `MongoTemplate`, Mongo `Aggregation`, and specific service loggers — one of those logger names (`com.agcs.fo.opusMotorGateway.service...`) does not match the actual package (`com.agcs.fo.opus.motor.service...`), so that particular override has no effect. `CustomRequestFilter` and `PolicyRefClient` log via `System.out`/`System.err` rather than SLF4J.
+- No distributed tracing dependency (Micrometer Tracing / Sleuth / OpenTelemetry) was found, and no dashboard links exist in the repository.
+
+## Caveats / Callouts
+
+- **No authentication/authorization** is enforced on any business endpoint (`anyRequest().permitAll()`); anything that can reach the service network-wise can call `/api/opus/GenerateReport`.
+- The main `POST` endpoint always returns HTTP 200 with `status: "SUCCESS"`, even for unrecognized report names or missing/null transactions — treat the XML payload contents, not the HTTP status, as the real success/failure signal (see Error Handling above).
+- `CommonController.forwardRequest` is a single ~300-line `switch` statement dispatching on report-name string literals; adding a new report type means editing this method directly, and there is no route-level separation between report types.
+- `ExtendedController` and `DocumentController` are empty placeholder classes with no endpoints — apparently unfinished/dead code.
+- `pom.xml`'s `artifactId`/`name` values (`" gi-documentprintdata "`) contain leading/trailing whitespace, and a commented-out alternate artifact block (`opusMotorGateway`) is left in place alongside them.
+- `OPUSConstants` (in `utils`) contains a large number of constants (legacy "FO"/CLAWS/migration/SOAP fault strings, XSLT filenames) that do not correspond to anything else in this codebase, suggesting it was copied from another OPUS service; not confirmed unused, but worth reviewing for removal.
+- Both `spring-boot-starter-web` and `spring-boot-starter-webflux` are dependencies; almost all code uses the servlet stack (`@RestController`, `RestTemplate`) — only `ClauseDescriptionClient` uses a reactive `WebClient` — so the app runs two web stacks side by side.
+
+## Related Documentation
+
+- Confluence — "How to Create/Generate README File" (space OPUSM): https://cmp.allianz.net/pages/viewpage.action?pageId=3125436760 — source template for this document.
+- No ADRs, design docs, or links to coupled repositories were found inside this repository. The reusable CI/CD pipeline (`java-microservice.yml`, `sast.yml`, `jira-commit-link-check.yml`) lives in `OPUSCCC/opus-github-cicd-workflows`, referenced from `.github/workflows/*.yml`, but no further documentation for it exists in this repo.
